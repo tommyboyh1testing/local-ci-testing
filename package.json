@@ -1,0 +1,9 @@
+{
+  "name": "local-ci-testing",
+  "version": "0.0.1",
+  "private": true,
+  "description": "PoC testbed — not for publication",
+  "scripts": {
+    "test": "echo \"no tests\" && exit 0"
+  }
+}

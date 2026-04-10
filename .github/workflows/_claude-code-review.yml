@@ -1,0 +1,1777 @@
+name: "[claude] Claude Code Review"
+
+# Reusable workflow for automated PR code reviews using Claude AI
+#
+# This workflow provides comprehensive code reviews with:
+# - Formal GitHub reviews (APPROVE/REQUEST_CHANGES/COMMENT)
+# - Inline comments on specific lines of code (as github-actions[bot])
+# - Patch-ID based caching to skip rebases
+# - Custom prompt support
+#
+# ARCHITECTURE:
+# This workflow uses a hybrid approach:
+# 1. Claude analyzes the PR and outputs structured JSON
+# 2. A TypeScript script parses the JSON and posts the review via gh CLI
+#
+# This ensures all comments appear as `github-actions[bot]` using the official
+# Anthropic action without needing a fork.
+#
+# USAGE:
+#   uses: Uniswap/ai-toolkit/.github/workflows/_claude-code-review.yml@main
+#   with:
+#     pr_number: ${{ github.event.pull_request.number }}
+#     base_ref: ${{ github.base_ref }}
+#   secrets:
+#     ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+#
+# FEATURES:
+# - Runs on every push but skips rebases (patch-ID detection)
+# - Creates inline comments like human reviewers
+# - Submits formal reviews for merge protection
+# - Supports custom prompts
+# - Comment trigger: "@request-claude-review" in any PR comment forces a new review
+# - Manual trigger via workflow_dispatch to force a new review
+#
+# NOTE: Re-requesting a review from github-actions[bot] via the GitHub UI
+# does NOT trigger this workflow. GitHub does not fire the review_requested
+# event when re-requesting reviews from bot accounts. Use the comment trigger
+# or manual workflow_dispatch instead.
+#
+# PERMISSIONS REQUIRED (calling workflow must grant these):
+#   contents: read
+#   pull-requests: write
+#   issues: read
+#   actions: read
+#   id-token: write
+
+on:
+  workflow_call:
+    inputs:
+      pr_number:
+        description: "Pull request number to review"
+        required: true
+        type: string
+
+      base_ref:
+        description: "Base branch name (e.g., main, master). Optional - if not provided, will be fetched via GitHub API."
+        required: false
+        type: string
+        default: ""
+
+      force_review:
+        description: "Force a full review even if the code hasn't changed (bypasses patch-ID cache)"
+        required: false
+        type: boolean
+        default: false
+
+      model:
+        description: "Claude model to use for review"
+        required: false
+        type: string
+        default: "claude-sonnet-4-6"
+
+      max_turns:
+        description: "Maximum conversation turns for Claude. Omit to use unlimited turns."
+        required: false
+        type: number
+
+      timeout_minutes:
+        description: "Job timeout in minutes"
+        required: false
+        type: number
+        default: 30
+
+      max_diff_lines:
+        description: "Maximum diff lines before skipping Claude review (PR considered too large). Default: 2000"
+        required: false
+        type: number
+        default: 2000
+
+      allowed_tools:
+        description: 'Comma-separated list of allowed tools for Claude (e.g., "Read,Grep,Glob"). Leave empty for default read-only set.'
+        required: false
+        type: string
+        default: ""
+
+      toolkit_ref:
+        description: "Git ref (branch, tag, or SHA) of ai-toolkit to use for the post-review script. Defaults to 'main'. Use 'next' or a specific SHA to test unreleased changes."
+        required: false
+        type: string
+        default: "main"
+
+      prompt_override_files_to_skip:
+        description: |
+          Path to a markdown file in the repository that overrides the "Files to Skip" section.
+          Example: https://github.com/Uniswap/ai-toolkit/blob/next/.github/prompts/pr-review/overridable/5-files-to-skip.md
+        required: false
+        type: string
+        default: ""
+
+      prompt_override_review_priorities:
+        description: |
+          Path to a markdown file in the repository that overrides the "Review Priorities" section.
+          Example: https://github.com/Uniswap/ai-toolkit/blob/next/.github/prompts/pr-review/overridable/4-review-priorities.md
+        required: false
+        type: string
+        default: ""
+
+      prompt_override_communication_style:
+        description: |
+          Path to a markdown file in the repository that overrides the "Communication Style" section.
+          Example: https://github.com/Uniswap/ai-toolkit/blob/next/.github/prompts/pr-review/overridable/6-communication-style.md
+        required: false
+        type: string
+        default: ""
+
+      prompt_override_pattern_recognition:
+        description: |
+          Path to a markdown file in the repository that overrides the "Pattern Recognition" section.
+          Example: https://github.com/Uniswap/ai-toolkit/blob/next/.github/prompts/pr-review/overridable/7-pattern-recognition.md
+        required: false
+        type: string
+        default: ""
+
+      prompt_override_initial_review_process:
+        description: |
+          Path to a markdown file in the repository that overrides the "Initial Review Process" section.
+          Example: https://github.com/Uniswap/ai-toolkit/blob/next/.github/prompts/pr-review/overridable/8-initial-review-process.md
+        required: false
+        type: string
+        default: ""
+
+      prompt_override_avoid_patterns:
+        description: |
+          Path to a markdown file in the repository that overrides the "Avoid Patterns" section.
+          Example: https://github.com/Uniswap/ai-toolkit/blob/next/.github/prompts/pr-review/overridable/9-avoid-patterns.md
+        required: false
+        type: string
+        default: ""
+
+      prompt_override_verdict_approve:
+        description: |
+          Path to a markdown file in the repository that overrides the "Verdict: APPROVE" section.
+          Example: https://github.com/Uniswap/ai-toolkit/blob/next/.github/prompts/pr-review/overridable/10-verdict-approve.md
+        required: false
+        type: string
+        default: ""
+
+      prompt_override_verdict_request_changes:
+        description: |
+          Path to a markdown file in the repository that overrides the "Verdict: REQUEST_CHANGES" section.
+          Example: https://github.com/Uniswap/ai-toolkit/blob/next/.github/prompts/pr-review/overridable/11-verdict-request-changes.md
+        required: false
+        type: string
+        default: ""
+
+      prompt_override_verdict_comment:
+        description: |
+          Path to a markdown file in the repository that overrides the "Verdict: COMMENT" section.
+          Example: https://github.com/Uniswap/ai-toolkit/blob/next/.github/prompts/pr-review/overridable/12-verdict-comment.md
+        required: false
+        type: string
+        default: ""
+
+      prompt_override_re_review_process:
+        description: |
+          Path to a markdown file in the repository that overrides the "Re-Review Process" section (for re-reviews).
+          Example: https://github.com/Uniswap/ai-toolkit/blob/next/.github/prompts/pr-review/overridable/16-re-review-process.md
+        required: false
+        type: string
+        default: ""
+
+      install_uniswap_plugins:
+        description: |
+          Whether to install the uniswap-ai-toolkit plugins automatically.
+
+          When true (default): Plugins are discovered dynamically from marketplace.json
+          (minus any excluded via exclude_plugins).
+
+          When false: No uniswap plugins are installed. Use this if you want to
+          use only your own plugins via plugin_marketplaces and plugins inputs.
+        required: false
+        type: boolean
+        default: true
+
+      exclude_plugins:
+        description: |
+          Newline-separated list of plugin names to exclude from auto-installation.
+          Defaults to 'uniswap-integrations'.
+        required: false
+        type: string
+        default: |
+          uniswap-integrations
+          spec-workflow
+          claude-setup
+
+      auto_fix:
+        description: |
+          When enabled, if the review finds issues (REQUEST_CHANGES verdict),
+          Claude will automatically attempt to fix them and push the changes
+          to the PR branch. This triggers a new push event, which will run a
+          fresh review of the fixed code.
+
+          Requires WORKFLOW_PAT secret with repo scope for pushing commits.
+
+          Default: false (backwards compatible)
+        required: false
+        type: boolean
+        default: false
+
+      max_auto_fix_cycles:
+        description: |
+          Maximum number of consecutive auto-fix cycles allowed before stopping.
+          Each cycle is: review finds issues → auto-fix pushes changes → re-review.
+          The count resets when a human pushes a commit.
+
+          Set to 1 for a single fix attempt (default), or higher to allow
+          multiple rounds of review→fix→re-review.
+
+          Default: 1
+        required: false
+        type: number
+        default: 1
+
+      auto_fix_model:
+        description: |
+          Claude model to use for auto-fixing issues. If not specified, uses
+          the same model as the review. You may want to use a more capable
+          model (e.g., Opus) for complex fixes.
+        required: false
+        type: string
+        default: ""
+
+    secrets:
+      ANTHROPIC_API_KEY:
+        description: "Anthropic API key for Claude access. Required unless CLAUDE_CODE_OAUTH_TOKEN is provided."
+        required: false
+      CLAUDE_CODE_OAUTH_TOKEN:
+        description: "Claude Code OAuth token for authentication. Alternative to ANTHROPIC_API_KEY. When provided, takes precedence over API key."
+        required: false
+      WORKFLOW_PAT:
+        description: "Personal Access Token with repo scope. Required for: (1) resolving review threads via GraphQL API, and (2) auto-fix pushes that trigger subsequent workflow runs. Falls back to GITHUB_TOKEN if not provided, but auto-fix pushes with GITHUB_TOKEN will NOT trigger new workflow runs."
+        required: false
+
+jobs:
+  claude-review:
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout_minutes }}
+    env:
+      MAX_CLAUDE_DIFF_LINES: ${{ inputs.max_diff_lines }} # any PR with a `git diff` larger than this will be considered too large for Claude review
+    # Fixed permissions (cannot be overridden by calling workflow)
+    permissions:
+      id-token: write # Required for OIDC
+      contents: write # Required to read code and push fixes when auto_fix is enabled
+      pull-requests: write # Required to comment and submit reviews
+      issues: read # Required to read PR discussions
+      actions: read # Required to check CI status
+
+    steps:
+      # Security scanning (required for all workflows)
+      - name: Security Scan
+        uses: bullfrogsec/bullfrog@1831f79cce8ad602eef14d2163873f27081ebfb3 # v0.8.4
+        with:
+          egress-policy: audit
+
+      # Checkout required before using local composite actions
+      - name: Checkout repository
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+          fetch-depth: 50
+
+      # Download validate-claude-auth action if caller repo doesn't have it
+      # This allows external repos to use this reusable workflow without copying the action
+      - name: Ensure validate-claude-auth action exists
+        env:
+          TOOLKIT_REF: ${{ inputs.toolkit_ref }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ACTION_FILE=".github/actions/validate-claude-auth/action.yml"
+
+          if [ -f "$ACTION_FILE" ]; then
+            echo "Using local validate-claude-auth action"
+          else
+            echo "Downloading validate-claude-auth action from ai-toolkit@${TOOLKIT_REF}..."
+            mkdir -p .github/actions/validate-claude-auth
+
+            # Use GitHub API (same pattern as _generate-pr-metadata.yml and _claude-task-worker.yml)
+            # Authentication required to avoid GitHub API rate limits on shared runner IPs
+            if ! curl -fSs --max-time 30 --max-redirs 3 \
+                      -H "Accept: application/vnd.github.v4.raw" \
+                      -H "Authorization: Bearer $GITHUB_TOKEN" \
+                      -L "https://api.github.com/repos/Uniswap/ai-toolkit/contents/.github/actions/validate-claude-auth/action.yml?ref=${TOOLKIT_REF}" \
+                      -o "$ACTION_FILE" 2>&1 | tee /tmp/curl-error.log; then
+              echo "::error::Failed to download validate-claude-auth action from ai-toolkit@${TOOLKIT_REF}"
+              cat /tmp/curl-error.log
+              exit 1
+            fi
+
+            # Verify the file was downloaded and has content
+            if [ ! -s "$ACTION_FILE" ]; then
+              echo "::error::Downloaded action.yml is empty"
+              exit 1
+            fi
+
+            # Verify it's a valid action file (has 'runs:' section)
+            if ! grep -q "^runs:" "$ACTION_FILE"; then
+              echo "::error::Downloaded action.yml is invalid (missing 'runs:' section)"
+              echo "File contents:"
+              cat "$ACTION_FILE"
+              exit 1
+            fi
+
+            echo "Successfully downloaded validate-claude-auth action from ai-toolkit@${TOOLKIT_REF}"
+          fi
+
+      - name: Validate Authentication
+        uses: ./.github/actions/validate-claude-auth
+        with:
+          anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude-oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+
+      # Fetch PR metadata via API:
+      # - head_sha: Checkout the exact PR commit (not GitHub's merge commit)
+      # - base_ref: Use provided value or fetch from API (makes base_ref input optional)
+      - name: Get PR Info
+        id: pr-info
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          INPUT_BASE_REF: ${{ inputs.base_ref }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          echo "ℹ️  Fetching PR #$PR_NUMBER info..."
+
+          # Fetch PR data once
+          PR_DATA=$(gh api repos/${GITHUB_REPOSITORY}/pulls/$PR_NUMBER)
+
+          # Extract head SHA (always needed)
+          HEAD_SHA=$(echo "$PR_DATA" | jq -r '.head.sha')
+          echo "head_sha=$HEAD_SHA" >> $GITHUB_OUTPUT
+          echo "📍 PR head SHA: $HEAD_SHA"
+
+          # Use provided base_ref or fetch from API
+          if [ -n "$INPUT_BASE_REF" ]; then
+            BASE_REF="$INPUT_BASE_REF"
+            echo "📍 Base ref (from input): $BASE_REF"
+          else
+            BASE_REF=$(echo "$PR_DATA" | jq -r '.base.ref')
+            echo "📍 Base ref (from API): $BASE_REF"
+          fi
+          echo "base_ref=$BASE_REF" >> $GITHUB_OUTPUT
+
+          # Calculate merge base - the common ancestor commit where the PR branch
+          # diverged from the base branch. This matches what GitHub shows in the
+          # PR diff view, which is more accurate than using base.sha (the current
+          # HEAD of the base branch) when the base branch has moved forward.
+          echo "📍 Calculating merge base..."
+          COMPARE_DATA=$(gh api "repos/${GITHUB_REPOSITORY}/compare/${BASE_REF}...${HEAD_SHA}")
+          MERGE_BASE_SHA=$(echo "$COMPARE_DATA" | jq -r '.merge_base_commit.sha')
+          echo "merge_base_sha=$MERGE_BASE_SHA" >> $GITHUB_OUTPUT
+          echo "📍 Merge base SHA: $MERGE_BASE_SHA"
+
+          # Also output base_sha for reference (current HEAD of base branch)
+          BASE_SHA=$(echo "$PR_DATA" | jq -r '.base.sha')
+          echo "base_sha=$BASE_SHA" >> $GITHUB_OUTPUT
+          echo "📍 Base branch HEAD: $BASE_SHA"
+
+          if [ "$MERGE_BASE_SHA" != "$BASE_SHA" ]; then
+            echo "ℹ️  Note: Base branch has moved forward since PR was created"
+            echo "   Using merge base for accurate diff calculation"
+          fi
+
+      # Setup Node.js BEFORE checking out PR code.
+      # Security: PR checkout may contain a malicious .npmrc that redirects
+      # the npm registry, so all npm operations must complete first.
+      - name: Setup Node.js (Early)
+        uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+        with:
+          node-version: "22"
+
+      # Checkout the exact PR head commit (not GitHub's merge commit)
+      - name: Checkout Repository
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+          ref: ${{ steps.pr-info.outputs.head_sha }}
+          fetch-depth: 1 # Shallow clone - merge base fetched separately
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+
+      # Fetch just the merge base commit tree for diff computation.
+      # Full history is unnecessary — git diff only needs the two commit trees.
+      - name: Fetch merge base for diff
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MERGE_BASE_SHA: ${{ steps.pr-info.outputs.merge_base_sha }}
+        run: |
+          git -c http.extraheader="Authorization: basic $(echo -n "x-access-token:${GITHUB_TOKEN}" | base64)" \
+            fetch --depth=1 origin "$MERGE_BASE_SHA"
+          echo "✅ Fetched merge base: ${MERGE_BASE_SHA:0:12}"
+
+      # Defense-in-depth: remove any attacker-supplied binaries from PR checkout
+      - name: Remove untrusted node_modules binaries
+        run: |
+          if [ -d "node_modules/.bin" ]; then
+            rm -rf node_modules/.bin
+            echo "🗑️  Removed node_modules/.bin from PR checkout"
+          fi
+
+      # Download post-review script from trusted ref (never use PR checkout files)
+      # Security: Always fetch from a trusted ref to prevent script tampering via PR
+      - name: Setup Post Review Script (Early)
+        id: setup-script-early
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TOOLKIT_REF: ${{ inputs.toolkit_ref }}
+        run: |
+          set -euo pipefail
+
+          echo "ℹ️  Downloading post-review.ts from Uniswap/ai-toolkit@${TOOLKIT_REF}"
+
+          # Always download from trusted ref - never use local files from PR checkout
+          # This prevents attackers from modifying scripts in their PR
+          if ! curl -fSs \
+                    -H "Accept: application/vnd.github.v4.raw" \
+                    -H "Authorization: Bearer $GITHUB_TOKEN" \
+                    -L "https://api.github.com/repos/Uniswap/ai-toolkit/contents/.github/scripts/post-review.ts?ref=${TOOLKIT_REF}" \
+                    -o /tmp/post-review.ts 2>&1 | tee /tmp/curl-error.log; then
+            echo "❌ Failed to download post-review.ts from Uniswap/ai-toolkit@${TOOLKIT_REF}"
+            echo "   Error details:"
+            cat /tmp/curl-error.log | head -5
+            exit 1
+          fi
+
+          echo "✅ Downloaded post-review.ts from ref: $TOOLKIT_REF"
+          echo "script_path=/tmp/post-review.ts" >> $GITHUB_OUTPUT
+
+      # Calculate patch-ID (stable hash of code changes, survives rebases)
+      # This must run BEFORE posting in-progress so we can check cache first
+      - name: Calculate Patch ID
+        id: patch-id
+        env:
+          # Use merge base SHA - the common ancestor where PR branch diverged
+          # This matches what GitHub shows in the PR diff view
+          MERGE_BASE_SHA: ${{ steps.pr-info.outputs.merge_base_sha }}
+        run: |
+          # Use the merge base SHA calculated from the compare API
+          # This ensures we compare against exactly what GitHub shows in the PR diff
+          echo "merge_base_sha=$MERGE_BASE_SHA" >> $GITHUB_OUTPUT
+          echo "📍 Merge base SHA: $MERGE_BASE_SHA"
+
+          # Calculate stable patch-ID (same code = same ID, even after rebase)
+          # This diff contains ONLY the PR's changes compared to the merge base
+          PATCH_ID=$(git diff ${MERGE_BASE_SHA}..HEAD | git patch-id --stable | cut -d' ' -f1)
+
+          echo "patch_id=$PATCH_ID" >> $GITHUB_OUTPUT
+          echo "📊 Patch-ID: ${PATCH_ID:0:12}... (first 12 chars)"
+          echo "   This ID stays the same across rebases if code hasn't changed"
+
+      # Check cache BEFORE posting in-progress to preserve existing review
+      # Skip cache check entirely when force_review is enabled
+      - name: Check Review Cache
+        id: cache-check
+        if: inputs.force_review != true
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: .review-cache
+          # Include merge_base_sha in cache key to invalidate when the merge base changes
+          # (e.g., when a stacked PR's parent is merged and it rebases to main)
+          key: review-pr${{ inputs.pr_number }}-base-${{ steps.patch-id.outputs.merge_base_sha }}-patch-${{ steps.patch-id.outputs.patch_id }}
+          lookup-only: true # Just check, don't restore
+
+      # Early exit if we've already reviewed this code (rebase detected)
+      # Never skip when force_review is enabled
+      # IMPORTANT: This runs BEFORE posting in-progress to preserve existing review content
+      - name: Skip Review if No Changes
+        if: steps.cache-check.outputs.cache-hit == 'true' && inputs.force_review != true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          POST_REVIEW_SCRIPT: ${{ steps.setup-script-early.outputs.script_path }}
+          PATCH_ID: ${{ steps.patch-id.outputs.patch_id }}
+        run: |
+          echo "✅ Skipping review - no actual code changes detected"
+          echo ""
+          echo "This push appears to be a rebase or merge without new code changes."
+          echo "Patch-ID: $PATCH_ID"
+          echo ""
+          echo "We've already reviewed this exact code, so skipping to save API costs."
+          echo ""
+          echo "💡 To force a new review, use the manual trigger with force_review: true"
+
+          # Add status banner to existing review (preserving full content)
+          echo ""
+          echo "ℹ️  Adding 'still valid' status banner to existing review..."
+
+          REPO_OWNER=$(echo "$GITHUB_REPOSITORY" | cut -d'/' -f1)
+          REPO_NAME=$(echo "$GITHUB_REPOSITORY" | cut -d'/' -f2)
+
+          bun run "$POST_REVIEW_SCRIPT" \
+            --mode skipped \
+            --owner "$REPO_OWNER" \
+            --repo "$REPO_NAME" \
+            --pr-number "$PR_NUMBER"
+
+          echo "✅ Review preserved with status banner"
+          exit 0
+
+      # Log when force review is enabled
+      - name: Force Review Enabled
+        if: inputs.force_review == true
+        run: |
+          echo "🔄 Force review enabled - bypassing cache check"
+          echo "   A full review will run regardless of previous reviews for this code"
+
+      # Detect trivial PRs for fast-path review
+      # Only runs if we're actually going to do a review (not cached)
+      - name: Detect Trivial PR
+        id: pr-size
+        if: steps.cache-check.outputs.cache-hit != 'true'
+        env:
+          MERGE_BASE_SHA: ${{ steps.patch-id.outputs.merge_base_sha }}
+        run: |
+          # Reuse merge base SHA from patch-id step
+          echo "📍 Using merge base SHA: $MERGE_BASE_SHA"
+
+          # Count lines changed (additions + deletions)
+          STATS=$(git diff --shortstat ${MERGE_BASE_SHA}..HEAD)
+
+          # Extract insertions and deletions, default to 0 if not present
+          INSERTIONS=$(echo "$STATS" | grep -oP '\d+(?= insertion)' || echo "0")
+          DELETIONS=$(echo "$STATS" | grep -oP '\d+(?= deletion)' || echo "0")
+          TOTAL_CHANGES=$((INSERTIONS + DELETIONS))
+
+          echo "lines_changed=$TOTAL_CHANGES" >> $GITHUB_OUTPUT
+          echo "📊 Total lines changed: $TOTAL_CHANGES"
+
+          # Determine if this is a trivial PR (< 20 lines changed)
+          if [ "$TOTAL_CHANGES" -lt 20 ]; then
+            echo "is_trivial=true" >> $GITHUB_OUTPUT
+            echo "✨ Trivial PR detected (< 20 lines) - will use fast review mode"
+          else
+            echo "is_trivial=false" >> $GITHUB_OUTPUT
+            echo "📝 Standard PR - will use comprehensive review mode"
+          fi
+
+      # Post "Review in Progress" comment ONLY if we're actually going to review
+      # This runs AFTER cache check to preserve existing review on cache hits
+      - name: Post Review In Progress
+        id: in-progress
+        if: steps.cache-check.outputs.cache-hit != 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          POST_REVIEW_SCRIPT: ${{ steps.setup-script-early.outputs.script_path }}
+        run: |
+          set -euo pipefail
+
+          echo "ℹ️  Posting 'review in progress' status..."
+
+          # Parse owner and repo
+          REPO_OWNER=$(echo "$GITHUB_REPOSITORY" | cut -d'/' -f1)
+          REPO_NAME=$(echo "$GITHUB_REPOSITORY" | cut -d'/' -f2)
+
+          # Post in-progress comment (creates or updates the bot's comment)
+          bun run "$POST_REVIEW_SCRIPT" \
+            --mode in-progress \
+            --owner "$REPO_OWNER" \
+            --repo "$REPO_NAME" \
+            --pr-number "$PR_NUMBER"
+
+          echo "✅ In-progress status posted"
+
+      # Fetch existing review comments for context
+      - name: Fetch Existing Review Comments
+        if: steps.cache-check.outputs.cache-hit != 'true'
+        id: existing-comments
+        env:
+          PR_NUMBER: ${{ inputs.pr_number }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          echo "ℹ️  Fetching existing review comments for context..."
+
+          # Get existing review comments (for re-review context)
+          # Include in_reply_to_id to identify thread structure for accurate resolution decisions
+          COMMENTS=$(gh api "/repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/comments" \
+            --jq '[.[] | {id: .id, path: .path, line: .line, body: .body, user: .user.login, in_reply_to_id: .in_reply_to_id}]' || echo "[]")
+
+          # Save to file for prompt inclusion
+          echo "$COMMENTS" > /tmp/existing-comments.json
+
+          COMMENT_COUNT=$(echo "$COMMENTS" | jq 'length')
+          echo "existing_comment_count=$COMMENT_COUNT" >> $GITHUB_OUTPUT
+
+          if [ "$COMMENT_COUNT" -gt 0 ]; then
+            echo "ℹ️  Found $COMMENT_COUNT existing review comment(s)"
+          else
+            echo "ℹ️  No existing review comments found (initial review)"
+          fi
+
+      # Generate the PR diff for Claude to review
+      # This ensures Claude reviews ONLY the PR's changes, not other commits merged to main
+      - name: Generate PR Diff
+        if: steps.cache-check.outputs.cache-hit != 'true'
+        id: pr-diff
+        env:
+          MERGE_BASE_SHA: ${{ steps.patch-id.outputs.merge_base_sha }}
+        run: |
+          set -euo pipefail
+
+          echo "ℹ️  Generating PR diff..."
+
+          # Reuse merge base SHA from patch-id step (calculated via compare API)
+          # This ensures we compare against exactly what GitHub shows in the PR diff view
+          echo "📍 Using merge base SHA: $MERGE_BASE_SHA"
+
+          # Define lockfile pattern for grep filtering
+          # Note: We use grep -v instead of git pathspec exclusions because pathspec
+          # exclusions have inconsistent behavior across different shell environments.
+          # The grep approach is more portable and reliable.
+          LOCKFILE_PATTERN='(^|/)(package-lock\.json|bun\.lock[b]?|yarn\.lock|pnpm-lock\.yaml|Podfile\.lock|composer\.lock|Gemfile\.lock|Cargo\.lock|poetry\.lock|go\.sum)$'
+
+          # Generate the list of changed files (excluding lockfiles)
+          ALL_CHANGED_FILES=$(git diff --name-only ${MERGE_BASE_SHA}..HEAD)
+          CHANGED_FILES=$(echo "$ALL_CHANGED_FILES" | grep -vE "$LOCKFILE_PATTERN" || true)
+          FILE_COUNT=$(echo "$CHANGED_FILES" | grep -c . || echo "0")
+          echo "📁 Files changed (excluding lockfiles): $FILE_COUNT"
+
+          # Generate the full diff (excluding lockfiles)
+          # This is the ONLY diff Claude should review - it contains exactly the PR's changes
+          # Pass the filtered file list to git diff to generate diff for only those files
+          if [ -n "$CHANGED_FILES" ]; then
+            echo "$CHANGED_FILES" | tr '\n' '\0' | xargs -0 git diff ${MERGE_BASE_SHA}..HEAD -- > /tmp/pr-diff.txt
+          else
+            # No non-lockfile changes - create empty diff
+            touch /tmp/pr-diff.txt
+          fi
+
+          DIFF_SIZE=$(wc -c < /tmp/pr-diff.txt)
+          echo "📊 Diff size: $DIFF_SIZE bytes"
+
+          # Save changed files list
+          echo "$CHANGED_FILES" > /tmp/changed-files.txt
+
+          echo "✅ PR diff generated successfully"
+
+      # Upload diff files as artifacts for debugging and inspection
+      - name: Upload PR Diff Artifacts
+        if: steps.cache-check.outputs.cache-hit != 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: pr-diff-files-pr${{ inputs.pr_number }}
+          path: |
+            /tmp/changed-files.txt
+            /tmp/pr-diff.txt
+          retention-days: 7
+          if-no-files-found: warn
+
+      # Check if PR diff is too large for Claude review
+      - name: Check PR Diff Size
+        id: diff-size
+        if: steps.cache-check.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+
+          # Count lines in the diff
+          DIFF_LINES=$(wc -l < /tmp/pr-diff.txt)
+          echo "📊 Diff line count: $DIFF_LINES"
+
+          # Check if diff is too large for Claude review
+          if [ "$DIFF_LINES" -gt "$MAX_CLAUDE_DIFF_LINES" ]; then
+            echo "is_too_large=true" >> $GITHUB_OUTPUT
+            echo "⚠️  PR diff is too large for Claude review (> $MAX_CLAUDE_DIFF_LINES lines)"
+          else
+            echo "is_too_large=false" >> $GITHUB_OUTPUT
+            echo "✅ PR diff size is acceptable for Claude review"
+          fi
+
+          echo "line_count=$DIFF_LINES" >> $GITHUB_OUTPUT
+
+      # Post "PR too large" message and exit if diff exceeds threshold
+      - name: Post PR Too Large Message
+        if: steps.cache-check.outputs.cache-hit != 'true' && steps.diff-size.outputs.is_too_large == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          POST_REVIEW_SCRIPT: ${{ steps.setup-script-early.outputs.script_path }}
+          DIFF_LINE_COUNT: ${{ steps.diff-size.outputs.line_count }}
+        run: |
+          set -euo pipefail
+
+          echo "ℹ️  Posting 'PR too large' message..."
+
+          # Parse owner and repo
+          REPO_OWNER=$(echo "$GITHUB_REPOSITORY" | cut -d'/' -f1)
+          REPO_NAME=$(echo "$GITHUB_REPOSITORY" | cut -d'/' -f2)
+
+          # Post message that PR is too large for Claude review
+          bun run "$POST_REVIEW_SCRIPT" \
+            --mode too-large \
+            --owner "$REPO_OWNER" \
+            --repo "$REPO_NAME" \
+            --pr-number "$PR_NUMBER" \
+            --line-count "$DIFF_LINE_COUNT" \
+            --max-diff-lines "$MAX_CLAUDE_DIFF_LINES"
+
+          echo "✅ 'PR too large' message posted"
+          echo "⏭️  Skipping Claude review due to large diff size"
+          exit 0
+
+      # Download build-prompt script from trusted ref (never use PR checkout files)
+      # Security: Always fetch from a trusted ref to prevent script tampering via PR
+      - name: Setup Build Prompt Script
+        if: steps.cache-check.outputs.cache-hit != 'true' && steps.diff-size.outputs.is_too_large != 'true'
+        id: setup-build-prompt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TOOLKIT_REF: ${{ inputs.toolkit_ref }}
+        run: |
+          set -euo pipefail
+
+          echo "ℹ️  Downloading build-prompt.ts from Uniswap/ai-toolkit@${TOOLKIT_REF}"
+
+          if ! curl -fSs \
+                    -H "Accept: application/vnd.github.v4.raw" \
+                    -H "Authorization: Bearer $GITHUB_TOKEN" \
+                    -L "https://api.github.com/repos/Uniswap/ai-toolkit/contents/.github/scripts/build-prompt.ts?ref=${TOOLKIT_REF}" \
+                    -o /tmp/build-prompt.ts 2>&1 | tee /tmp/curl-error.log; then
+            echo "❌ Failed to download build-prompt.ts"
+            cat /tmp/curl-error.log | head -5
+            exit 1
+          fi
+          echo "✅ Downloaded build-prompt.ts"
+          echo "script_path=/tmp/build-prompt.ts" >> $GITHUB_OUTPUT
+
+      # Fetch prompt section files from trusted ref (never use PR checkout files)
+      # Security: Always fetch from a trusted ref to prevent prompt tampering via PR
+      - name: Fetch Prompt Section Files
+        if: steps.cache-check.outputs.cache-hit != 'true' && steps.diff-size.outputs.is_too_large != 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TOOLKIT_REF: ${{ inputs.toolkit_ref }}
+        run: |
+          set -euo pipefail
+
+          PROMPT_DIR="/tmp/pr-review-prompts"
+          mkdir -p "$PROMPT_DIR/fixed" "$PROMPT_DIR/overridable"
+
+          echo "ℹ️  Downloading prompt section files from Uniswap/ai-toolkit@${TOOLKIT_REF}..."
+
+          # Define all section files to download
+          # Section numbering: 1-3 (fixed early), 4-12 (overridable), 13-15 (fixed late),
+          # 16-18 (conditional), 19 (fixed final)
+          FIXED_SECTIONS=(
+            "1-review-context.md"
+            "2-diff-instructions.md"
+            "3-repository-context.md"
+            "13-inline-comment-rules.md"
+            "14-important-notes.md"
+            "15-comment-examples.md"
+            "17-existing-comments.md"
+            "18-fast-review-mode.md"
+            "19-output-guidance.md"
+          )
+
+          OVERRIDABLE_SECTIONS=(
+            "4-review-priorities.md"
+            "5-files-to-skip.md"
+            "6-communication-style.md"
+            "7-pattern-recognition.md"
+            "8-initial-review-process.md"
+            "9-avoid-patterns.md"
+            "10-verdict-approve.md"
+            "11-verdict-request-changes.md"
+            "12-verdict-comment.md"
+            "16-re-review-process.md"
+          )
+
+          # Download fixed sections
+          for section in "${FIXED_SECTIONS[@]}"; do
+            curl -fSs \
+              -H "Accept: application/vnd.github.v4.raw" \
+              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              -L "https://api.github.com/repos/Uniswap/ai-toolkit/contents/.github/prompts/pr-review/fixed/${section}?ref=${TOOLKIT_REF}" \
+              -o "$PROMPT_DIR/fixed/${section}" 2>/dev/null || echo "::warning::Failed to fetch fixed/${section}"
+          done
+
+          # Download overridable sections
+          for section in "${OVERRIDABLE_SECTIONS[@]}"; do
+            curl -fSs \
+              -H "Accept: application/vnd.github.v4.raw" \
+              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              -L "https://api.github.com/repos/Uniswap/ai-toolkit/contents/.github/prompts/pr-review/overridable/${section}?ref=${TOOLKIT_REF}" \
+              -o "$PROMPT_DIR/overridable/${section}" 2>/dev/null || echo "::warning::Failed to fetch overridable/${section}"
+          done
+
+          echo "✅ Prompt section files ready"
+          ls -la "$PROMPT_DIR/fixed/" | head -5
+          ls -la "$PROMPT_DIR/overridable/" | head -5
+
+      # Validate override paths for security (prevent path traversal)
+      - name: Validate Override Paths
+        if: steps.cache-check.outputs.cache-hit != 'true' && steps.diff-size.outputs.is_too_large != 'true'
+        env:
+          OVERRIDE_FILES_TO_SKIP: ${{ inputs.prompt_override_files_to_skip }}
+          OVERRIDE_REVIEW_PRIORITIES: ${{ inputs.prompt_override_review_priorities }}
+          OVERRIDE_COMMUNICATION_STYLE: ${{ inputs.prompt_override_communication_style }}
+          OVERRIDE_PATTERN_RECOGNITION: ${{ inputs.prompt_override_pattern_recognition }}
+          OVERRIDE_INITIAL_REVIEW_PROCESS: ${{ inputs.prompt_override_initial_review_process }}
+          OVERRIDE_AVOID_PATTERNS: ${{ inputs.prompt_override_avoid_patterns }}
+          OVERRIDE_VERDICT_APPROVE: ${{ inputs.prompt_override_verdict_approve }}
+          OVERRIDE_VERDICT_REQUEST_CHANGES: ${{ inputs.prompt_override_verdict_request_changes }}
+          OVERRIDE_VERDICT_COMMENT: ${{ inputs.prompt_override_verdict_comment }}
+          OVERRIDE_RE_REVIEW_PROCESS: ${{ inputs.prompt_override_re_review_process }}
+        run: |
+          set -euo pipefail
+
+          echo "🔒 Validating override paths for security..."
+
+          validate_path() {
+            local path="$1"
+            local name="$2"
+
+            # Empty path is OK (no override)
+            if [ -z "$path" ]; then
+              return 0
+            fi
+
+            # Reject absolute paths
+            if [[ "$path" == /* ]]; then
+              echo "❌ ERROR: Absolute paths not allowed for $name: $path"
+              return 1
+            fi
+
+            # Reject path traversal attempts
+            if [[ "$path" == *../* ]] || [[ "$path" == ../* ]] || [[ "$path" == */../* ]]; then
+              echo "❌ ERROR: Path traversal not allowed for $name: $path"
+              return 1
+            fi
+
+            # Verify file exists in repository
+            if [ ! -f "$path" ]; then
+              echo "⚠️  WARNING: Override file not found for $name: $path (will use default)"
+            else
+              echo "✅ Valid override for $name: $path"
+            fi
+
+            return 0
+          }
+
+          # Validate all override paths
+          validation_failed=false
+
+          if ! validate_path "$OVERRIDE_FILES_TO_SKIP" "files_to_skip"; then
+            validation_failed=true
+          fi
+
+          if ! validate_path "$OVERRIDE_REVIEW_PRIORITIES" "review_priorities"; then
+            validation_failed=true
+          fi
+
+          if ! validate_path "$OVERRIDE_COMMUNICATION_STYLE" "communication_style"; then
+            validation_failed=true
+          fi
+
+          if ! validate_path "$OVERRIDE_PATTERN_RECOGNITION" "pattern_recognition"; then
+            validation_failed=true
+          fi
+
+          if ! validate_path "$OVERRIDE_INITIAL_REVIEW_PROCESS" "initial_review_process"; then
+            validation_failed=true
+          fi
+
+          if ! validate_path "$OVERRIDE_AVOID_PATTERNS" "avoid_patterns"; then
+            validation_failed=true
+          fi
+
+          if ! validate_path "$OVERRIDE_VERDICT_APPROVE" "verdict_approve"; then
+            validation_failed=true
+          fi
+
+          if ! validate_path "$OVERRIDE_VERDICT_REQUEST_CHANGES" "verdict_request_changes"; then
+            validation_failed=true
+          fi
+
+          if ! validate_path "$OVERRIDE_VERDICT_COMMENT" "verdict_comment"; then
+            validation_failed=true
+          fi
+
+          if ! validate_path "$OVERRIDE_RE_REVIEW_PROCESS" "re_review_process"; then
+            validation_failed=true
+          fi
+
+          if [ "$validation_failed" = true ]; then
+            echo ""
+            echo "❌ Override path validation failed - aborting for security"
+            exit 1
+          fi
+
+          echo "✅ All override paths validated"
+
+      # Build final prompt using TypeScript script
+      - name: Build Review Prompt
+        if: steps.cache-check.outputs.cache-hit != 'true' && steps.diff-size.outputs.is_too_large != 'true'
+        id: build-prompt
+        env:
+          OVERRIDE_FILES_TO_SKIP: ${{ inputs.prompt_override_files_to_skip }}
+          OVERRIDE_REVIEW_PRIORITIES: ${{ inputs.prompt_override_review_priorities }}
+          OVERRIDE_COMMUNICATION_STYLE: ${{ inputs.prompt_override_communication_style }}
+          OVERRIDE_PATTERN_RECOGNITION: ${{ inputs.prompt_override_pattern_recognition }}
+          OVERRIDE_INITIAL_REVIEW_PROCESS: ${{ inputs.prompt_override_initial_review_process }}
+          OVERRIDE_AVOID_PATTERNS: ${{ inputs.prompt_override_avoid_patterns }}
+          OVERRIDE_VERDICT_APPROVE: ${{ inputs.prompt_override_verdict_approve }}
+          OVERRIDE_VERDICT_REQUEST_CHANGES: ${{ inputs.prompt_override_verdict_request_changes }}
+          OVERRIDE_VERDICT_COMMENT: ${{ inputs.prompt_override_verdict_comment }}
+          OVERRIDE_RE_REVIEW_PROCESS: ${{ inputs.prompt_override_re_review_process }}
+          BUILD_PROMPT_SCRIPT: ${{ steps.setup-build-prompt.outputs.script_path }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          BASE_REF: ${{ steps.pr-info.outputs.base_ref }}
+          PATCH_ID: ${{ steps.patch-id.outputs.patch_id }}
+          MERGE_BASE_SHA: ${{ steps.patch-id.outputs.merge_base_sha }}
+          LINES_CHANGED: ${{ steps.pr-size.outputs.lines_changed }}
+          EXISTING_COMMENT_COUNT: ${{ steps.existing-comments.outputs.existing_comment_count }}
+          IS_TRIVIAL: ${{ steps.pr-size.outputs.is_trivial }}
+        run: |
+          set -euo pipefail
+
+          echo "📝 Building prompt using TypeScript script"
+
+          # Parse repository owner and name
+          REPO_OWNER=$(echo "$REPO" | cut -d'/' -f1)
+          REPO_NAME=$(echo "$REPO" | cut -d'/' -f2)
+
+          # Run the build-prompt script
+          bun run "$BUILD_PROMPT_SCRIPT" \
+            --prompt-dir "/tmp/pr-review-prompts" \
+            --output "/tmp/final-prompt.txt" \
+            --repo-owner "$REPO_OWNER" \
+            --repo-name "$REPO_NAME" \
+            --pr-number "$PR_NUMBER" \
+            --base-ref "$BASE_REF" \
+            --patch-id "$PATCH_ID" \
+            --base-sha "$MERGE_BASE_SHA" \
+            --lines-changed "$LINES_CHANGED" \
+            --existing-comment-count "$EXISTING_COMMENT_COUNT" \
+            --is-trivial "$IS_TRIVIAL" \
+            --changed-files-file "/tmp/changed-files.txt" \
+            --pr-diff-file "/tmp/pr-diff.txt" \
+            --existing-comments-file "/tmp/existing-comments.json"
+
+          # Output the file path (not content) to avoid Bun parsing issues with large prompts
+          # The prompt content is written to /tmp/final-prompt.txt by the script above
+          # Claude Code will read the file via the @path reference in the prompt
+          echo "prompt_file_path=/tmp/final-prompt.txt" >> $GITHUB_OUTPUT
+
+          # Show prompt size and preview for debugging
+          echo ""
+          PROMPT_SIZE=$(wc -c < "/tmp/final-prompt.txt")
+          PROMPT_LINES=$(wc -l < "/tmp/final-prompt.txt")
+          echo "📊 Prompt size: $PROMPT_SIZE bytes, $PROMPT_LINES lines"
+          echo ""
+          echo "📄 Prompt preview (first 15 lines):"
+          head -n 15 "/tmp/final-prompt.txt"
+
+      # Upload final prompt as artifact for debugging and inspection
+      - name: Upload Final Prompt Artifact
+        if: steps.cache-check.outputs.cache-hit != 'true' && steps.diff-size.outputs.is_too_large != 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: final-prompt-pr${{ inputs.pr_number }}
+          path: /tmp/final-prompt.txt
+          retention-days: 7
+          if-no-files-found: warn
+
+      # Build Claude arguments - READ-ONLY tools only (no GitHub write tools)
+      - name: Build Claude Arguments
+        if: steps.cache-check.outputs.cache-hit != 'true' && steps.diff-size.outputs.is_too_large != 'true'
+        id: build-args
+        env:
+          INPUT_ALLOWED_TOOLS: ${{ inputs.allowed_tools }}
+          INPUT_MAX_TURNS: ${{ inputs.max_turns }}
+          INPUT_MODEL: ${{ inputs.model }}
+        run: |
+          # Build allowed tools list - READ-ONLY tools only
+          # Claude outputs JSON, the post-review script handles GitHub writes
+          if [ -n "$INPUT_ALLOWED_TOOLS" ]; then
+            ALLOWED_TOOLS="$INPUT_ALLOWED_TOOLS"
+          else
+            # Define read-only tools for analysis
+            TOOLS=(
+              # File operations (read-only)
+              "Read"
+              "Grep"
+              "Glob"
+
+              # Git commands for context (read-only)
+              "Bash(git log:*)"
+              "Bash(git diff:*)"
+              "Bash(git show:*)"
+              "Bash(git blame:*)"
+              "Bash(git rev-parse:*)"
+
+              # GitHub MCP tools (read-only, for fetching PR context)
+              "mcp__github__get_pull_request"
+              "mcp__github__get_pull_request_files"
+              "mcp__github__get_pull_request_comments"
+              "mcp__github__get_pull_request_reviews"
+            )
+
+            # Join array elements with commas (no spaces)
+            ALLOWED_TOOLS=$(IFS=,; echo "${TOOLS[*]}")
+          fi
+
+          # Define JSON schema for structured output
+          # This ensures Claude returns validated JSON matching our expected format
+          JSON_SCHEMA='{
+            "type": "object",
+            "properties": {
+              "pr_review_body": {
+                "type": "string",
+                "description": "Markdown-formatted review summary with all analysis"
+              },
+              "pr_review_outcome": {
+                "type": "string",
+                "enum": ["COMMENT", "APPROVE", "REQUEST_CHANGES"],
+                "description": "Review decision"
+              },
+              "inline_comments_new": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "path": { "type": "string", "description": "File path" },
+                    "line": { "type": "integer", "description": "Line number" },
+                    "body": { "type": "string", "description": "Comment text" },
+                    "suggestion": { "type": "string", "description": "Optional code suggestion" }
+                  },
+                  "required": ["path", "line", "body"]
+                },
+                "description": "New inline comments on specific lines"
+              },
+              "inline_comments_responses": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "comment_id": { "type": "integer", "description": "ID of existing comment" },
+                    "body": { "type": "string", "description": "Response text" },
+                    "should_resolve": { "type": "boolean", "description": "Whether to resolve the thread" }
+                  },
+                  "required": ["comment_id", "body"]
+                },
+                "description": "Responses to existing review comments"
+              },
+              "files_reviewed": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "List of files reviewed"
+              },
+              "confidence": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1,
+                "description": "Confidence level (0.0-1.0)"
+              }
+            },
+            "required": ["pr_review_body", "pr_review_outcome", "inline_comments_new"]
+          }'
+
+          # Build claude_args conditionally based on provided inputs
+          CLAUDE_ARGS="--model $INPUT_MODEL"
+
+          # Only add --max-turns if explicitly provided (not empty or 0)
+          # Note: GitHub Actions number inputs default to 0 when not provided
+          if [ -n "$INPUT_MAX_TURNS" ] && [ "$INPUT_MAX_TURNS" != "0" ]; then
+            CLAUDE_ARGS="$CLAUDE_ARGS
+            --max-turns $INPUT_MAX_TURNS"
+            echo "ℹ️  Including --max-turns $INPUT_MAX_TURNS"
+          else
+            echo "ℹ️  Omitting --max-turns (unlimited turns)"
+          fi
+
+          # Add JSON schema for structured output (ensures validated JSON response)
+          # Compact the schema to a single line for the CLI argument
+          COMPACT_SCHEMA=$(echo "$JSON_SCHEMA" | jq -c .)
+          CLAUDE_ARGS="$CLAUDE_ARGS
+            --json-schema '$COMPACT_SCHEMA'
+            --allowedTools $ALLOWED_TOOLS"
+
+          echo "allowed_tools=$ALLOWED_TOOLS" >> $GITHUB_OUTPUT
+          echo "claude_args<<CLAUDE_ARGS_EOF" >> $GITHUB_OUTPUT
+          echo "$CLAUDE_ARGS" >> $GITHUB_OUTPUT
+          echo "CLAUDE_ARGS_EOF" >> $GITHUB_OUTPUT
+          echo "✅ Configured structured output with JSON schema"
+          echo "✅ Configured read-only tools (${#ALLOWED_TOOLS} chars)"
+
+      # Build plugin configuration using shared composite action
+      - name: Build plugin configuration
+        if: steps.cache-check.outputs.cache-hit != 'true' && steps.diff-size.outputs.is_too_large != 'true'
+        id: build-plugins
+        uses: Uniswap/ai-toolkit/.github/actions/build-plugin-config@bc20d5cb11941235a629ccd7e296eb6d8a4a2028 # pinned to next
+        with:
+          install_uniswap_plugins: ${{ inputs.install_uniswap_plugins }}
+          exclude_plugins: ${{ inputs.exclude_plugins }}
+
+      # Run Claude Code Action to perform the review (analysis only, outputs JSON)
+      # Supports both API key and OAuth token authentication (validated in earlier step)
+      # NOTE: We use a file reference (@path) instead of passing prompt content directly
+      # to avoid Bun parsing issues with large prompts (GitHub Actions output size limits)
+      - name: Run Claude Code Review
+        if: steps.cache-check.outputs.cache-hit != 'true' && steps.diff-size.outputs.is_too_large != 'true'
+        id: claude
+        uses: anthropics/claude-code-action@df37d2f0760a4b5683a6e617c9325bc1a36443f6 # v1.0.75
+        with:
+          # Authentication: provide either API key or OAuth token (validated in earlier step)
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # github_token is required for OAuth authentication
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          # Use file reference to avoid passing large prompt content through GitHub Actions outputs
+          # Claude Code will read the file and execute the instructions within it
+          prompt: "Read and act upon the prompt at @${{ steps.build-prompt.outputs.prompt_file_path }}"
+          # Disable built-in progress tracking - we handle our own PR comments
+          track_progress: false
+          # Show full Claude output in logs for debugging
+          show_full_output: false
+          allowed_bots: dependabot
+          claude_args: ${{ steps.build-args.outputs.claude_args }}
+          # Plugin configuration (requires claude-code-action v1.0.28+)
+          plugin_marketplaces: ${{ steps.build-plugins.outputs.plugin_marketplaces }}
+          plugins: ${{ steps.build-plugins.outputs.plugins }}
+          additional_permissions: |
+            actions: read
+
+      # Note: Node.js is already set up earlier for posting in-progress status
+
+      # Extract Claude's structured output (validated JSON from --json-schema)
+      - name: Extract Claude Response
+        if: steps.cache-check.outputs.cache-hit != 'true' && steps.diff-size.outputs.is_too_large != 'true' && success()
+        id: extract-response
+        env:
+          STRUCTURED_OUTPUT: ${{ steps.claude.outputs.structured_output }}
+        run: |
+          set -euo pipefail
+
+          echo "ℹ️  Extracting structured output from Claude..."
+
+          # The structured_output is already validated JSON from --json-schema
+          if [ -z "$STRUCTURED_OUTPUT" ]; then
+            echo "❌ No structured_output from Claude"
+            echo "   This may indicate the --json-schema flag wasn't processed correctly"
+            exit 1
+          fi
+
+          # Save the structured output for the post-review script
+          echo "$STRUCTURED_OUTPUT" > /tmp/claude-review-response.txt
+          echo "✅ Extracted structured output (${#STRUCTURED_OUTPUT} chars)"
+
+          # Show preview and validate it's proper JSON
+          echo "📋 Response preview:"
+          echo "$STRUCTURED_OUTPUT" | jq -r '.pr_review_outcome // "unknown"' | xargs -I{} echo "  Outcome: {}"
+          echo "$STRUCTURED_OUTPUT" | jq -r '.inline_comments_new | length' | xargs -I{} echo "  Inline comments: {}"
+          echo "$STRUCTURED_OUTPUT" | jq -r '.confidence // "not set"' | xargs -I{} echo "  Confidence: {}"
+
+      # Upload Claude execution output as artifact for debugging
+      - name: Upload Claude Execution Output
+        if: steps.cache-check.outputs.cache-hit != 'true' && steps.diff-size.outputs.is_too_large != 'true' && always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: claude-execution-output-pr${{ inputs.pr_number }}
+          path: /home/runner/work/_temp/claude-execution-output.json
+          retention-days: 7
+          if-no-files-found: warn
+
+      # Note: Post-review script is already downloaded/located earlier for in-progress status
+
+      # Post the review using our script (all comments as github-actions[bot])
+      - name: Post Review via Script
+        if: steps.cache-check.outputs.cache-hit != 'true' && steps.diff-size.outputs.is_too_large != 'true' && success()
+        id: post-review
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # WORKFLOW_PAT is used for GraphQL operations (resolving review threads)
+          # that require elevated permissions beyond what GITHUB_TOKEN provides
+          GH_TOKEN_FOR_GRAPHQL: ${{ secrets.WORKFLOW_PAT || secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          # Pass file path instead of content to avoid shell injection risks
+          # The script reads the file directly, avoiding shell expansion of content
+          REVIEW_JSON_FILE: /tmp/claude-review-response.txt
+          # Script path determined by early setup step (local or downloaded)
+          POST_REVIEW_SCRIPT: ${{ steps.setup-script-early.outputs.script_path }}
+        run: |
+          set -euo pipefail
+
+          echo "ℹ️  Parsing Claude's review output and posting to GitHub..."
+          echo "ℹ️  Using script: $POST_REVIEW_SCRIPT"
+
+          # Parse owner and repo
+          REPO_OWNER=$(echo "$GITHUB_REPOSITORY" | cut -d'/' -f1)
+          REPO_NAME=$(echo "$GITHUB_REPOSITORY" | cut -d'/' -f2)
+
+          # Verify the response file exists
+          if [ ! -f "$REVIEW_JSON_FILE" ]; then
+            echo "❌ No review response file found at $REVIEW_JSON_FILE"
+            exit 1
+          fi
+
+          # Check that the file has content
+          if [ ! -s "$REVIEW_JSON_FILE" ]; then
+            echo "❌ No review output from Claude (file is empty)"
+            exit 1
+          fi
+
+          echo "ℹ️  Review response length: $(wc -c < "$REVIEW_JSON_FILE") bytes"
+
+          # Run the post-review script (path from setup-script step)
+          # REVIEW_JSON_FILE env var is passed to the script, which reads the file directly
+          # This avoids shell expansion of file content (shell injection safe)
+          bun run "$POST_REVIEW_SCRIPT" \
+            --owner "$REPO_OWNER" \
+            --repo "$REPO_NAME" \
+            --pr-number "$PR_NUMBER"
+
+          echo "✅ Review posted successfully"
+
+      # Upload post-review API request files for debugging
+      # These temp files contain the JSON payloads sent to GitHub API
+      - name: Upload Post Review Debug Artifacts
+        if: steps.cache-check.outputs.cache-hit != 'true' && steps.diff-size.outputs.is_too_large != 'true' && always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: post-review-debug-pr${{ inputs.pr_number }}
+          path: /tmp/gh-input-*.json
+          retention-days: 7
+          if-no-files-found: ignore
+
+      # Fallback: Post review summary as PR comment if script fails
+      - name: Fallback Review Comment
+        if: steps.cache-check.outputs.cache-hit != 'true' && steps.diff-size.outputs.is_too_large != 'true' && failure()
+        env:
+          PR_NUMBER: ${{ inputs.pr_number }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          echo "⚠️  Script failed, posting Claude's output as comment fallback..."
+
+          COMMENT_MARKER="<!-- claude-pr-review-bot -->"
+          JOB_URL="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+          # Try to read the extracted response, fallback to execution file
+          if [ -f /tmp/claude-review-response.txt ]; then
+            SUMMARY=$(cat /tmp/claude-review-response.txt)
+          elif [ -f /home/runner/work/_temp/claude-execution-output.json ]; then
+            SUMMARY=$(cat /home/runner/work/_temp/claude-execution-output.json | head -c 10000)
+          else
+            SUMMARY="No review output available"
+          fi
+
+          # Generate fallback comment
+          COMMENT_BODY=$(cat <<EOF
+          ${COMMENT_MARKER}
+          ## 🤖 Claude Code Review
+
+          **Status:** ⚠️ Partial (script error)
+          **Job:** [View workflow run](${JOB_URL})
+
+          ---
+
+          The review was completed but there was an error posting inline comments.
+
+          <details>
+          <summary>Raw Review Output</summary>
+
+          \`\`\`
+          ${SUMMARY:0:10000}
+          \`\`\`
+
+          </details>
+
+          ---
+
+          *Please check the workflow logs for details.*
+          EOF
+          )
+
+          # Post as PR comment
+          gh api "/repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+            -X POST \
+            -f body="$COMMENT_BODY" \
+            > /dev/null
+
+          echo "✅ Fallback comment posted"
+
+      # Post error comment if Claude completely fails (no output at all)
+      - name: Post Review Error Comment
+        if: steps.cache-check.outputs.cache-hit != 'true' && steps.diff-size.outputs.is_too_large != 'true' && failure() && steps.claude.conclusion == 'failure'
+        env:
+          PR_NUMBER: ${{ inputs.pr_number }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          COMMENT_MARKER="<!-- claude-pr-review-bot -->"
+          JOB_URL="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+          echo "ℹ️  Posting review error comment" >&2
+
+          # Generate error comment body
+          COMMENT_BODY=$(cat <<EOF
+          ${COMMENT_MARKER}
+          ## 🤖 Claude Code Review
+
+          **Status:** ❌ Error
+          **Job:** [View workflow run](${JOB_URL})
+
+          ---
+
+          ### ⚠️ Review Failed
+
+          The automated code review encountered an error and could not complete.
+
+          **Next Steps:**
+          1. Check the [workflow logs](${JOB_URL}) for details
+          2. Verify the GitHub Actions configuration
+          3. Ensure the Anthropic API key is valid
+          4. Check for any permission issues
+
+          If the problem persists, please contact your repository administrator.
+
+          ---
+
+          *You can manually re-trigger the review by pushing a new commit or re-running the workflow.*
+          EOF
+          )
+
+          # Post comment
+          gh api "/repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+            -X POST \
+            -f body="$COMMENT_BODY" \
+            > /dev/null
+
+          echo "✅ Error comment posted" >&2
+
+      # Save successful review to cache
+      - name: Save Review Cache Marker
+        if: steps.cache-check.outputs.cache-hit != 'true' && steps.diff-size.outputs.is_too_large != 'true' && success()
+        env:
+          PATCH_ID: ${{ steps.patch-id.outputs.patch_id }}
+        run: |
+          mkdir -p .review-cache
+          echo "$PATCH_ID" > .review-cache/patch-id
+          echo "Cached review for patch-ID: $PATCH_ID"
+
+      # Persist cache for future rebase detection
+      - name: Cache Review State
+        if: steps.cache-check.outputs.cache-hit != 'true' && steps.diff-size.outputs.is_too_large != 'true' && success()
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: .review-cache
+          # Include merge_base_sha in cache key to invalidate when the merge base changes
+          # (e.g., when a stacked PR's parent is merged and it rebases to main)
+          key: review-pr${{ inputs.pr_number }}-base-${{ steps.patch-id.outputs.merge_base_sha }}-patch-${{ steps.patch-id.outputs.patch_id }}
+
+      # ============================================================================
+      # AUTO-FIX SECTION
+      # When auto_fix is enabled and review found issues, attempt to fix them
+      # ============================================================================
+
+      # Check if we should attempt auto-fix
+      - name: Check Auto-Fix Conditions
+        id: auto-fix-check
+        if: |
+          inputs.auto_fix == true &&
+          steps.cache-check.outputs.cache-hit != 'true' &&
+          steps.diff-size.outputs.is_too_large != 'true' &&
+          success()
+        env:
+          REVIEW_JSON_FILE: /tmp/claude-review-response.txt
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          MAX_AUTO_FIX_CYCLES: ${{ inputs.max_auto_fix_cycles }}
+        run: |
+          set -euo pipefail
+
+          echo "🔧 Checking if auto-fix should run..."
+          echo "📊 Max auto-fix cycles allowed: $MAX_AUTO_FIX_CYCLES"
+
+          # Guard against infinite auto-fix loops by counting consecutive
+          # auto-fix commits from HEAD. A human commit resets the count.
+          #
+          # Security: Uses the GitHub API to verify the commit AUTHOR identity
+          # (not spoofable via commit message) as the primary guard. The commit
+          # message pattern is checked as defense in depth with an anchored regex
+          # to avoid false positives from reverts or commits that mention "auto-fix".
+          #
+          # We use .author.login (GitHub-verified identity) without falling back
+          # to .commit.author.name (user-controlled git metadata). If .author.login
+          # is null (e.g., unlinked email), the guard won't trigger — fail open
+          # means auto-fix runs, which is the safe default.
+
+          # Fetch PR commits in chronological order, then reverse to walk from HEAD backward
+          COMMITS=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/commits" \
+            --paginate \
+            --jq '[.[] | {author_login: (.author.login // empty), message: (.commit.message | split("\n")[0])}]' \
+            | jq -s 'add // []')
+
+          # Count consecutive auto-fix commits from HEAD (most recent first).
+          # Walk backwards through the commit array; stop at the first non-auto-fix commit.
+          CONSECUTIVE_COUNT=$(echo "$COMMITS" | jq '
+            . as $commits |
+            ($commits | length) as $len |
+            {count: 0, done: false} |
+            reduce range($len - 1; -1; -1) as $i (.;
+              if .done then .
+              elif $commits[$i].author_login == "github-actions[bot]"
+                   and ($commits[$i].message | test("^\\w+\\(claude\\):.*\\(auto-fix\\)$"))
+              then .count += 1
+              else .done = true
+              end
+            ) | .count')
+
+          echo "📊 Consecutive auto-fix commits from HEAD: $CONSECUTIVE_COUNT"
+
+          if [ "$CONSECUTIVE_COUNT" -ge "$MAX_AUTO_FIX_CYCLES" ]; then
+            echo "ℹ️  Auto-fix cycle limit reached ($CONSECUTIVE_COUNT >= $MAX_AUTO_FIX_CYCLES) — skipping to prevent loop"
+            echo "should_fix=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "✅ Auto-fix cycles remaining: $(( MAX_AUTO_FIX_CYCLES - CONSECUTIVE_COUNT ))"
+
+          # Read the review outcome
+          if [ ! -f "$REVIEW_JSON_FILE" ]; then
+            echo "❌ No review response file found"
+            echo "should_fix=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          OUTCOME=$(jq -r '.pr_review_outcome // "unknown"' < "$REVIEW_JSON_FILE")
+          INLINE_COUNT=$(jq -r '.inline_comments_new | length' < "$REVIEW_JSON_FILE")
+
+          echo "📋 Review outcome: $OUTCOME"
+          echo "📋 Inline comments: $INLINE_COUNT"
+
+          # Only auto-fix if there are actual issues to fix
+          if [ "$OUTCOME" = "REQUEST_CHANGES" ]; then
+            echo "✅ Auto-fix will run (REQUEST_CHANGES verdict)"
+            echo "should_fix=true" >> $GITHUB_OUTPUT
+          elif [ "$OUTCOME" = "COMMENT" ] && [ "$INLINE_COUNT" -gt 0 ]; then
+            echo "✅ Auto-fix will run (COMMENT verdict with inline comments)"
+            echo "should_fix=true" >> $GITHUB_OUTPUT
+          else
+            echo "ℹ️  Skipping auto-fix (no issues found or APPROVE verdict)"
+            echo "should_fix=false" >> $GITHUB_OUTPUT
+          fi
+
+      # Get PR branch info for checkout
+      - name: Get PR Branch Info
+        id: pr-branch
+        if: steps.auto-fix-check.outputs.should_fix == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          echo "📍 Getting PR branch information..."
+
+          PR_DATA=$(gh api repos/${GITHUB_REPOSITORY}/pulls/$PR_NUMBER)
+          BRANCH_NAME=$(echo "$PR_DATA" | jq -r '.head.ref')
+          REPO_FULL_NAME=$(echo "$PR_DATA" | jq -r '.head.repo.full_name')
+
+          echo "branch_name=$BRANCH_NAME" >> $GITHUB_OUTPUT
+          echo "repo_full_name=$REPO_FULL_NAME" >> $GITHUB_OUTPUT
+          echo "📍 PR branch: $BRANCH_NAME"
+          echo "📍 PR repo: $REPO_FULL_NAME"
+
+      # Checkout with write access for auto-fix
+      # Note: For forked PRs, we need to checkout from the fork's repository
+      # Security: Only allow auto-fix for same-repo PRs (not forks)
+      - name: Checkout for Auto-Fix
+        if: steps.auto-fix-check.outputs.should_fix == 'true' && steps.pr-branch.outputs.repo_full_name == github.repository
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          repository: ${{ steps.pr-branch.outputs.repo_full_name }}
+          ref: ${{ steps.pr-branch.outputs.branch_name }}
+          token: ${{ secrets.WORKFLOW_PAT || secrets.GITHUB_TOKEN }}
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Configure git credentials for push (auto-fix)
+        if: steps.auto-fix-check.outputs.should_fix == 'true' && steps.pr-branch.outputs.repo_full_name == github.repository
+        env:
+          # Use WORKFLOW_PAT for push so the commit triggers subsequent workflow runs.
+          # Pushes with GITHUB_TOKEN do NOT trigger workflows (GitHub's loop prevention).
+          PUSH_TOKEN: ${{ secrets.WORKFLOW_PAT || github.token }}
+          HAS_WORKFLOW_PAT: ${{ secrets.WORKFLOW_PAT && 'true' || 'false' }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          if [ "$HAS_WORKFLOW_PAT" != "true" ]; then
+            echo "⚠️  WORKFLOW_PAT not set — falling back to GITHUB_TOKEN."
+            echo "   Auto-fix push will NOT trigger subsequent workflow runs."
+            echo "   Set the WORKFLOW_PAT secret to enable re-triggering."
+          fi
+          git remote set-url origin "https://x-access-token:${PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+
+      # Defense-in-depth: remove any attacker-supplied binaries from auto-fix checkout
+      - name: Remove potentially compromised bin directory (auto-fix)
+        if: steps.auto-fix-check.outputs.should_fix == 'true' && steps.pr-branch.outputs.repo_full_name == github.repository
+        run: |
+          if [ -d "node_modules/.bin" ]; then
+            rm -rf node_modules/.bin
+            echo "Removed node_modules/.bin after auto-fix checkout"
+          fi
+
+      # Build auto-fix prompt from review results
+      - name: Build Auto-Fix Prompt
+        id: build-fix-prompt
+        if: steps.auto-fix-check.outputs.should_fix == 'true' && steps.pr-branch.outputs.repo_full_name == github.repository
+        env:
+          REVIEW_JSON_FILE: /tmp/claude-review-response.txt
+          PR_NUMBER: ${{ inputs.pr_number }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          echo "📝 Building auto-fix prompt from review results..."
+
+          # Extract review body and inline comments
+          REVIEW_BODY=$(jq -r '.pr_review_body // "No review body"' < "$REVIEW_JSON_FILE")
+          INLINE_COMMENTS=$(jq -r '.inline_comments_new // []' < "$REVIEW_JSON_FILE")
+
+          # Build the fix prompt
+          cat > /tmp/auto-fix-prompt.txt << 'PROMPT_EOF'
+          # Auto-Fix Task
+
+          You are fixing issues identified in a code review. The review found problems that need to be addressed.
+
+          ## Instructions
+
+          1. **Read the review feedback below** to understand what issues were identified
+          2. **Fix ONLY the issues mentioned** - don't make unrelated changes
+          3. **Make minimal, focused fixes** - address each issue directly without over-engineering
+          4. **Run any relevant linters/formatters** after making changes
+          5. **Do NOT create new commits** - just make the file changes (the workflow will commit)
+
+          ## Review Feedback
+
+          PROMPT_EOF
+
+          # Add review body
+          echo "$REVIEW_BODY" >> /tmp/auto-fix-prompt.txt
+
+          # Add inline comments if any
+          COMMENT_COUNT=$(echo "$INLINE_COMMENTS" | jq 'length')
+          if [ "$COMMENT_COUNT" -gt 0 ]; then
+            echo "" >> /tmp/auto-fix-prompt.txt
+            echo "## Inline Comments to Address" >> /tmp/auto-fix-prompt.txt
+            echo "" >> /tmp/auto-fix-prompt.txt
+
+            # Format each inline comment
+            echo "$INLINE_COMMENTS" | jq -r '.[] | "### \(.path):\(.line)\n\n\(.body)\n"' >> /tmp/auto-fix-prompt.txt
+          fi
+
+          # Add final instructions
+          cat >> /tmp/auto-fix-prompt.txt << 'PROMPT_EOF'
+
+          ## Important
+
+          - Focus on fixing the identified issues
+          - Do not add new features or make stylistic changes beyond what's needed
+          - If a fix is unclear or risky, skip it rather than making a potentially wrong change
+          - After making changes, verify they compile/lint if possible
+          PROMPT_EOF
+
+          echo "prompt_file=/tmp/auto-fix-prompt.txt" >> $GITHUB_OUTPUT
+          echo "✅ Auto-fix prompt built ($(wc -l < /tmp/auto-fix-prompt.txt) lines)"
+
+      # Run Claude to fix the issues
+      - name: Run Claude Auto-Fix
+        id: claude-fix
+        if: steps.auto-fix-check.outputs.should_fix == 'true' && steps.pr-branch.outputs.repo_full_name == github.repository
+        uses: anthropics/claude-code-action@df37d2f0760a4b5683a6e617c9325bc1a36443f6 # v1.0.75
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          prompt: "Read and execute the instructions at @${{ steps.build-fix-prompt.outputs.prompt_file }}"
+          track_progress: false
+          show_full_output: true
+          # Use auto_fix_model if specified, otherwise use the review model
+          # --allowedTools grants specific permissions for auto-fix
+          # without using the blanket --dangerously-skip-permissions flag.
+          # Bash is intentionally unrestricted here (unlike docs-check's
+          # Bash(git:*)) because code-review fixes may need to run linters,
+          # formatters, type checkers, and build tools to verify the fix.
+          claude_args: "--model ${{ inputs.auto_fix_model || inputs.model }} --allowedTools Read,Edit,Write,Grep,Glob,Bash,WebSearch,WebFetch"
+          # Note: plugin_marketplaces and plugins are intentionally omitted here.
+          # The marketplace and plugins were already installed by the "Run Claude Code
+          # Review" step earlier in this job. Both steps share the same runner and
+          # ~/.claude/ directory, so re-installing would cause a fatal
+          # "Marketplace already installed" error.
+
+      # Check for changes and commit
+      - name: Commit and Push Fixes
+        id: commit-fixes
+        if: steps.auto-fix-check.outputs.should_fix == 'true' && steps.pr-branch.outputs.repo_full_name == github.repository
+        env:
+          # Use WORKFLOW_PAT for push so the commit triggers subsequent workflow runs.
+          # Pushes with GITHUB_TOKEN do NOT trigger workflows (GitHub's loop prevention).
+          PUSH_TOKEN: ${{ secrets.WORKFLOW_PAT || github.token }}
+          HAS_WORKFLOW_PAT: ${{ secrets.WORKFLOW_PAT && 'true' || 'false' }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          BRANCH_NAME: ${{ steps.pr-branch.outputs.branch_name }}
+          SERVER_URL: ${{ github.server_url }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          WORKFLOW_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          echo "📦 Checking for changes to commit..."
+
+          # Check if there are any changes (including untracked new files)
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "ℹ️  No changes made by auto-fix"
+            echo "changes_pushed=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Configure git
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Defensive: re-configure remote URL with push token in case an
+          # earlier step (e.g., claude-code-action) reset git credentials.
+          git remote set-url origin "https://x-access-token:${PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+
+          # Stage all changes
+          git add -A
+
+          # Show what changed
+          echo "📋 Changes to commit:"
+          git diff --staged --stat
+
+          # Commit with descriptive message
+          git commit -m "fix(claude): address code review feedback (auto-fix)
+
+          Automated fixes applied by Claude Code Review workflow.
+
+          PR: #$PR_NUMBER
+          Workflow run: ${SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${WORKFLOW_RUN_ID}"
+
+          # Push the changes
+          echo "🚀 Pushing fixes to branch: $BRANCH_NAME"
+          git push origin HEAD:"$BRANCH_NAME"
+
+          echo "changes_pushed=true" >> $GITHUB_OUTPUT
+          echo "✅ Fixes committed and pushed"
+
+          if [ "$HAS_WORKFLOW_PAT" = "true" ]; then
+            echo "ℹ️  Pushed with WORKFLOW_PAT — this will trigger a new review of the fixed code"
+          else
+            echo "⚠️  Pushed with GITHUB_TOKEN — this will NOT trigger a new review"
+            echo "   Set the WORKFLOW_PAT secret to enable automatic re-review after auto-fix"
+          fi
+
+      # Post auto-fix status comment
+      - name: Post Auto-Fix Status
+        if: steps.auto-fix-check.outputs.should_fix == 'true' && steps.pr-branch.outputs.repo_full_name == github.repository
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          CHANGES_PUSHED: ${{ steps.commit-fixes.outputs.changes_pushed }}
+          CLAUDE_FIX_OUTCOME: ${{ steps.claude-fix.outcome }}
+          HAS_WORKFLOW_PAT: ${{ secrets.WORKFLOW_PAT && 'true' || 'false' }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          COMMENT_MARKER="<!-- claude-auto-fix-status -->"
+          JOB_URL="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+          if [ "$CHANGES_PUSHED" = "true" ]; then
+            if [ "$HAS_WORKFLOW_PAT" = "true" ]; then
+              RETRIGGER_NOTE="A new review will run automatically on the updated code."
+            else
+              RETRIGGER_NOTE="⚠️ \`WORKFLOW_PAT\` is not configured — this push will **not** trigger a new review automatically. Set the \`WORKFLOW_PAT\` secret to enable re-triggering."
+            fi
+            COMMENT_BODY=$(cat <<EOF
+          ${COMMENT_MARKER}
+          ## 🔧 Auto-Fix Applied
+
+          Claude automatically fixed issues identified in the code review and pushed the changes.
+
+          **Status:** ✅ Fixes pushed
+          **Job:** [View workflow run](${JOB_URL})
+
+          ${RETRIGGER_NOTE}
+
+          ---
+          *This is an automated fix. Please review the changes to ensure they are correct.*
+          EOF
+          )
+          elif [ "$CLAUDE_FIX_OUTCOME" = "failure" ]; then
+            COMMENT_BODY=$(cat <<EOF
+          ${COMMENT_MARKER}
+          ## 🔧 Auto-Fix Failed
+
+          Claude encountered an error while attempting to fix the review issues.
+
+          **Status:** ❌ Auto-fix failed
+          **Job:** [View workflow run](${JOB_URL})
+
+          Please review the workflow logs and fix the issues manually.
+
+          ---
+          *The auto-fix step failed. Manual intervention is required.*
+          EOF
+          )
+          else
+            COMMENT_BODY=$(cat <<EOF
+          ${COMMENT_MARKER}
+          ## 🔧 Auto-Fix Attempted
+
+          Claude attempted to fix issues but no changes were made.
+
+          **Status:** ℹ️ No changes
+          **Job:** [View workflow run](${JOB_URL})
+
+          This may mean the issues require manual intervention or Claude couldn't determine safe fixes.
+
+          ---
+          *Please review the issues manually.*
+          EOF
+          )
+          fi
+
+          # Find and update existing auto-fix comment, or create new one
+          EXISTING_COMMENT=$(gh api "/repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+            --jq ".[] | select(.body | contains(\"$COMMENT_MARKER\")) | .id" | head -1 || true)
+
+          if [ -n "$EXISTING_COMMENT" ]; then
+            gh api "/repos/${GITHUB_REPOSITORY}/issues/comments/${EXISTING_COMMENT}" \
+              -X PATCH \
+              -f body="$COMMENT_BODY" > /dev/null
+            echo "✅ Updated existing auto-fix status comment"
+          else
+            gh api "/repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+              -X POST \
+              -f body="$COMMENT_BODY" > /dev/null
+            echo "✅ Posted auto-fix status comment"
+          fi
