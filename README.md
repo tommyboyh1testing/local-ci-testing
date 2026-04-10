@@ -7,3 +7,7 @@ repository to verify a specific attack primitive. All activity is between
 two accounts controlled by the same researcher.
 
 Do not use this for anything real.
+
+## Contributing
+
+Please open a PR and ping a reviewer if you'd like feedback.
